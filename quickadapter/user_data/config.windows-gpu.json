@@ -1,0 +1,17 @@
+{
+  // Windows + NVIDIA GPU overrides for QuickAdapterV3.
+  // Usage:
+  //   --config user_data/config.json --config user_data/config.windows-gpu.json
+  "freqai": {
+    "identifier": "quickadapter-xgboost-futures-vol-x3-win-gpu",
+    "data_kitchen_thread_count": 4,
+    "model_training_parameters": {
+      // XGBoost GPU path (XGBoost >= 2.x).
+      "device": "cuda",
+      "tree_method": "hist",
+      "predictor": "auto",
+      "n_jobs": 8,
+      "verbosity": 0
+    }
+  }
+}

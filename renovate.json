@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "abandonments:recommended",
+    ":configMigration",
+    "group:allNonMajor",
+    "schedule:daily",
+    ":maintainLockFilesWeekly"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "**/Dockerfile*",
+        "**/docker-compose*.yml"
+      ],
+      "matchStrings": [
+        "ARG\\s+(?<depName>\\w+)_version=(?<currentValue>[^\\s]+)",
+        "\\s+(?<depName>\\w+)_version:\\s*(?<currentValue>[^\\s]+)"
+      ],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "{{{replace '_' '-' depName}}}"
+    }
+  ]
+}

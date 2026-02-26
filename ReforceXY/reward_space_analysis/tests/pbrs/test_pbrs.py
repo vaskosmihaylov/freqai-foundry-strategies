@@ -1,0 +1,1604 @@
+#!/usr/bin/env python3
+"""Tests for Potential-Based Reward Shaping (PBRS) mechanics."""
+
+import re
+import unittest
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import reward_space_analysis
+from reward_space_analysis import (
+    DEFAULT_IDLE_DURATION_MULTIPLIER,
+    DEFAULT_MODEL_REWARD_PARAMETERS,
+    PBRS_INVARIANCE_TOL,
+    Actions,
+    Positions,
+    _compute_entry_additive,
+    _compute_exit_additive,
+    _compute_exit_potential,
+    _compute_hold_potential,
+    _compute_unrealized_pnl_estimate,
+    _get_float_param,
+    apply_potential_shaping,
+    get_max_idle_duration_candles,
+    simulate_samples,
+    validate_reward_parameters,
+    write_complete_statistical_analysis,
+)
+
+from ..constants import (
+    PARAMS,
+    PBRS,
+    SCENARIOS,
+    SEEDS,
+    STATISTICAL,
+    TOLERANCE,
+)
+from ..helpers import (
+    assert_pbrs_invariance_report_classification,
+    assert_relaxed_multi_reason_aggregation,
+    build_validation_case,
+    calculate_reward_with_defaults,
+    execute_validation_batch,
+)
+from ..test_base import RewardSpaceTestBase
+
+pytestmark = pytest.mark.pbrs
+
+
+class TestPBRS(RewardSpaceTestBase):
+    """PBRS mechanics tests (transforms, parameters, potentials, invariance)."""
+
+    # ---------------- Potential transform mechanics ---------------- #
+
+    def test_pbrs_progressive_release_decay_clamped(self):
+        """Verifies progressive_release mode decay clamps at terminal.
+
+        Tolerance rationale: IDENTITY_RELAXED used for PBRS terminal state checks
+        due to accumulated errors from gamma discounting and potential calculations.
+        """
+        params = self.DEFAULT_PARAMS.copy()
+        params.update(
+            {
+                "potential_gamma": DEFAULT_MODEL_REWARD_PARAMETERS["potential_gamma"],
+                "exit_potential_mode": "progressive_release",
+                "exit_potential_decay": 5.0,
+                "hold_potential_enabled": True,
+                "entry_additive_enabled": False,
+                "exit_additive_enabled": False,
+            }
+        )
+        current_pnl = 0.02
+        current_dur = 0.5
+        profit_aim = PARAMS.PROFIT_AIM
+        prev_potential = _compute_hold_potential(
+            current_pnl,
+            profit_aim * PARAMS.RISK_REWARD_RATIO,
+            current_dur,
+            PARAMS.RISK_REWARD_RATIO,
+            params,
+            PARAMS.BASE_FACTOR,
+        )
+        (
+            _total_reward,
+            reward_shaping,
+            next_potential,
+            _pbrs_delta,
+            _entry_additive,
+            _exit_additive,
+        ) = apply_potential_shaping(
+            base_reward=0.0,
+            current_pnl=current_pnl,
+            pnl_target=profit_aim * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=current_dur,
+            next_pnl=0.0,
+            next_duration_ratio=0.0,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=True,
+            is_entry=False,
+            prev_potential=prev_potential,
+            params=params,
+        )
+        self.assertAlmostEqualFloat(next_potential, 0.0, tolerance=TOLERANCE.IDENTITY_RELAXED)
+        self.assertAlmostEqualFloat(
+            reward_shaping, -prev_potential, tolerance=TOLERANCE.IDENTITY_RELAXED
+        )
+
+    def test_pbrs_spike_cancel_invariance(self):
+        """Verifies spike_cancel mode produces near-zero terminal shaping."""
+        params = self.DEFAULT_PARAMS.copy()
+        params.update(
+            {
+                "potential_gamma": 0.9,
+                "exit_potential_mode": "spike_cancel",
+                "hold_potential_enabled": True,
+                "entry_additive_enabled": False,
+                "exit_additive_enabled": False,
+            }
+        )
+        current_pnl = 0.015
+        current_dur = 0.4
+        profit_aim = PARAMS.PROFIT_AIM
+        prev_potential = _compute_hold_potential(
+            current_pnl,
+            profit_aim * PARAMS.RISK_REWARD_RATIO,
+            current_dur,
+            PARAMS.RISK_REWARD_RATIO,
+            params,
+            PARAMS.BASE_FACTOR,
+        )
+
+        gamma = _get_float_param(
+            params,
+            "potential_gamma",
+            DEFAULT_MODEL_REWARD_PARAMETERS.get("potential_gamma", 0.95),
+        )
+        expected_next_potential = (
+            prev_potential / gamma if gamma not in (0.0, None) else prev_potential
+        )
+        (
+            _total_reward,
+            reward_shaping,
+            next_potential,
+            _pbrs_delta,
+            _entry_additive,
+            _exit_additive,
+        ) = apply_potential_shaping(
+            base_reward=0.0,
+            current_pnl=current_pnl,
+            pnl_target=profit_aim * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=current_dur,
+            next_pnl=0.0,
+            next_duration_ratio=0.0,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=True,
+            is_entry=False,
+            prev_potential=prev_potential,
+            params=params,
+        )
+        self.assertAlmostEqualFloat(
+            next_potential, expected_next_potential, tolerance=TOLERANCE.IDENTITY_RELAXED
+        )
+        self.assertNearZero(reward_shaping, atol=TOLERANCE.IDENTITY_RELAXED)
+
+    # ---------------- Invariance flags (simulate_samples) ---------------- #
+
+    def test_canonical_invariance_flag(self):
+        """Canonical mode + no additives -> invariant flag True per-sample.
+
+        Note: `simulate_samples()` generates synthetic trajectories (coherent episodes).
+        This test only verifies the per-sample invariance flag and numeric stability; it does not
+        assert any telescoping/zero-sum property for the shaping term.
+        """
+
+        params = self.base_params(
+            exit_potential_mode="canonical",
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            hold_potential_enabled=True,
+        )
+        df = simulate_samples(
+            params={**params, "max_trade_duration_candles": 100},
+            num_samples=SCENARIOS.SAMPLE_SIZE_MEDIUM,
+            seed=SEEDS.BASE,
+            base_factor=PARAMS.BASE_FACTOR,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            max_duration_ratio=2.0,
+            trading_mode="margin",
+            pnl_base_std=PARAMS.PNL_STD,
+            pnl_duration_vol_scale=PARAMS.PNL_DUR_VOL_SCALE,
+        )
+        unique_flags = set(df["pbrs_invariant"].unique().tolist())
+        self.assertEqual(unique_flags, {True}, f"Unexpected invariant flags: {unique_flags}")
+        for v in df["reward_shaping"].tolist():
+            self.assertFinite(float(v), name="reward_shaping")
+        self.assertLessEqual(float(df["reward_shaping"].abs().max()), PBRS.MAX_ABS_SHAPING)
+
+    def test_non_canonical_flag_false_and_sum_nonzero(self):
+        """Non-canonical mode -> invariant flags False and Σ shaping non-zero."""
+
+        params = self.base_params(
+            exit_potential_mode="progressive_release",
+            exit_potential_decay=0.25,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            hold_potential_enabled=True,
+        )
+        df = simulate_samples(
+            params={**params, "max_trade_duration_candles": 100},
+            num_samples=SCENARIOS.SAMPLE_SIZE_MEDIUM,
+            seed=SEEDS.BASE,
+            base_factor=PARAMS.BASE_FACTOR,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            max_duration_ratio=2.0,
+            trading_mode="margin",
+            pnl_base_std=PARAMS.PNL_STD,
+            pnl_duration_vol_scale=PARAMS.PNL_DUR_VOL_SCALE,
+        )
+        unique_flags = set(df["pbrs_invariant"].unique().tolist())
+        self.assertEqual(unique_flags, {False}, f"Unexpected invariant flags: {unique_flags}")
+        abs_sum = float(df["reward_shaping"].abs().sum())
+        self.assertGreater(
+            abs_sum,
+            PBRS_INVARIANCE_TOL * 2,
+            f"Expected non-trivial shaping magnitude (got {abs_sum})",
+        )
+
+    # ---------------- Additives and canonical path mechanics ---------------- #
+
+    def test_additive_components_disabled_return_zero(self):
+        """Verifies entry/exit additives return zero when disabled."""
+        params_entry = {"entry_additive_enabled": False, "entry_additive_ratio": 1.0}
+        val_entry = _compute_entry_additive(
+            0.5,
+            PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            0.3,
+            params_entry,
+            PARAMS.BASE_FACTOR,
+        )
+        self.assertEqual(float(val_entry), 0.0)
+        params_exit = {"exit_additive_enabled": False, "exit_additive_ratio": 1.0}
+        val_exit = _compute_exit_additive(
+            0.5,
+            PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            0.3,
+            params_exit,
+            PARAMS.BASE_FACTOR,
+        )
+        self.assertEqual(float(val_exit), 0.0)
+
+    def test_hold_potential_disabled_forces_zero_potential_on_entry(self):
+        """hold_potential_enabled=False: entry sets Φ(next)=0 and no shaping."""
+        params = self.base_params(
+            hold_potential_enabled=False,
+            exit_potential_mode="canonical",
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.93,
+        )
+        (
+            total,
+            reward_shaping,
+            next_potential,
+            pbrs_delta,
+            entry_additive,
+            exit_additive,
+        ) = apply_potential_shaping(
+            base_reward=0.25,
+            current_pnl=0.0,
+            pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=0.0,
+            next_pnl=0.01,
+            next_duration_ratio=0.0,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=False,
+            is_entry=True,
+            prev_potential=0.42,
+            params=params,
+        )
+        self.assertPlacesEqual(next_potential, 0.0, places=TOLERANCE.DECIMAL_PLACES_STRICT)
+        self.assertNearZero(reward_shaping, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertNearZero(pbrs_delta, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertNearZero(entry_additive, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertNearZero(exit_additive, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertAlmostEqualFloat(
+            total,
+            0.25,
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="Entry shaping must be suppressed when hold potential disabled",
+        )
+
+    def test_hold_potential_disabled_forces_zero_potential_on_hold(self):
+        """hold_potential_enabled=False: hold sets Φ(next)=0 and no shaping."""
+        params = self.base_params(
+            hold_potential_enabled=False,
+            exit_potential_mode="canonical",
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.93,
+        )
+        (
+            total,
+            reward_shaping,
+            next_potential,
+            pbrs_delta,
+            _entry_additive,
+            _exit_additive,
+        ) = apply_potential_shaping(
+            base_reward=-0.1,
+            current_pnl=0.02,
+            pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=0.4,
+            next_pnl=0.02,
+            next_duration_ratio=0.41,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=False,
+            is_entry=False,
+            prev_potential=0.5,
+            params=params,
+        )
+        self.assertPlacesEqual(next_potential, 0.0, places=TOLERANCE.DECIMAL_PLACES_STRICT)
+        self.assertNearZero(reward_shaping, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertNearZero(pbrs_delta, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertAlmostEqualFloat(
+            total,
+            -0.1,
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="Hold shaping must be suppressed when hold potential disabled",
+        )
+
+    def test_calculate_reward_preserves_potential_when_pbrs_disabled(self):
+        """calculate_reward() preserves stored potential when PBRS is disabled."""
+        params = self.base_params(
+            hold_potential_enabled=False,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            exit_potential_mode="non_canonical",
+        )
+        ctx = self.make_ctx(position=Positions.Neutral, action=Actions.Neutral)
+
+        prev_potential = 0.37
+        breakdown = calculate_reward_with_defaults(ctx, params, prev_potential=prev_potential)
+
+        self.assertAlmostEqualFloat(
+            breakdown.prev_potential,
+            prev_potential,
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="prev_potential must be preserved when PBRS disabled",
+        )
+        self.assertAlmostEqualFloat(
+            breakdown.next_potential,
+            prev_potential,
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="next_potential must equal prev_potential when PBRS disabled",
+        )
+        self.assertPlacesEqual(
+            breakdown.reward_shaping, 0.0, places=TOLERANCE.DECIMAL_PLACES_STRICT
+        )
+        self.assertPlacesEqual(breakdown.pbrs_delta, 0.0, places=TOLERANCE.DECIMAL_PLACES_STRICT)
+        self.assertAlmostEqualFloat(
+            breakdown.total,
+            breakdown.base_reward,
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="PBRS disabled total must equal base_reward",
+        )
+
+    def test_exit_potential_canonical(self):
+        """Verifies canonical exit resets potential (no params mutation)."""
+        params = self.base_params(
+            exit_potential_mode="canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+        )
+        params_before = dict(params)
+
+        base_reward = 0.25
+        current_pnl = 0.05
+        current_duration_ratio = 0.4
+        next_pnl = 0.0
+        next_duration_ratio = 0.0
+        total, shaping, next_potential, _pbrs_delta, _entry_additive, _exit_additive = (
+            apply_potential_shaping(
+                base_reward=base_reward,
+                current_pnl=current_pnl,
+                pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+                current_duration_ratio=current_duration_ratio,
+                next_pnl=next_pnl,
+                next_duration_ratio=next_duration_ratio,
+                risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+                base_factor=PARAMS.BASE_FACTOR,
+                is_exit=True,
+                is_entry=False,
+                prev_potential=0.789,
+                params=params,
+            )
+        )
+
+        self.assertEqual(params, params_before, "apply_potential_shaping must not mutate params")
+        self.assertPlacesEqual(next_potential, 0.0, places=TOLERANCE.DECIMAL_PLACES_STRICT)
+        self.assertAlmostEqual(shaping, -0.789, delta=TOLERANCE.IDENTITY_RELAXED)
+        residual = total - base_reward - shaping
+        self.assertAlmostEqual(residual, 0.0, delta=TOLERANCE.IDENTITY_RELAXED)
+        self.assertFinite(float(total), name="total")
+
+    def test_canonical_mode_suppresses_additives_even_if_enabled(self):
+        """Verifies canonical mode forces entry/exit additive terms to zero."""
+        params = self.base_params(
+            exit_potential_mode="canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=True,
+            exit_additive_enabled=True,
+            entry_additive_ratio=10.0,
+            exit_additive_ratio=10.0,
+        )
+
+        (
+            _total_entry,
+            _shaping_entry,
+            _next_potential_entry,
+            _pbrs_delta_entry,
+            entry_additive,
+            exit_additive_entry,
+        ) = apply_potential_shaping(
+            base_reward=0.0,
+            current_pnl=0.0,
+            pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=0.0,
+            next_pnl=0.02,
+            next_duration_ratio=0.0,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=False,
+            is_entry=True,
+            prev_potential=0.0,
+            params=params,
+        )
+        self.assertNearZero(entry_additive, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertNearZero(exit_additive_entry, atol=TOLERANCE.IDENTITY_STRICT)
+
+        current_pnl = 0.02
+        current_dur = 0.5
+        profit_aim = PARAMS.PROFIT_AIM
+        prev_potential = _compute_hold_potential(
+            current_pnl,
+            profit_aim * PARAMS.RISK_REWARD_RATIO,
+            current_dur,
+            PARAMS.RISK_REWARD_RATIO,
+            params,
+            PARAMS.BASE_FACTOR,
+        )
+
+        (
+            _total_exit,
+            _shaping_exit,
+            _next_potential_exit,
+            _pbrs_delta_exit,
+            entry_additive_exit,
+            exit_additive,
+        ) = apply_potential_shaping(
+            base_reward=0.0,
+            current_pnl=current_pnl,
+            pnl_target=profit_aim * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=current_dur,
+            next_pnl=0.0,
+            next_duration_ratio=0.0,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=True,
+            is_entry=False,
+            prev_potential=prev_potential,
+            params=params,
+        )
+
+        self.assertNearZero(entry_additive_exit, atol=TOLERANCE.IDENTITY_STRICT)
+        self.assertNearZero(exit_additive, atol=TOLERANCE.IDENTITY_STRICT)
+
+    def test_canonical_sweep_does_not_require_param_enforcement(self):
+        """Verifies canonical sweep runs without mutating params."""
+        params = self.base_params(
+            exit_potential_mode="canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+        )
+        params_before = dict(params)
+        terminal_next_potentials, shaping_values = self._canonical_sweep(params)
+        self.assertEqual(params, params_before)
+        if terminal_next_potentials:
+            self.assertTrue(all(abs(p) < PBRS.TERMINAL_TOL for p in terminal_next_potentials))
+        max_abs = max(abs(v) for v in shaping_values) if shaping_values else 0.0
+        self.assertLessEqual(max_abs, PBRS.MAX_ABS_SHAPING)
+
+    def test_progressive_release_negative_decay_clamped(self):
+        """Verifies negative decay clamping: next potential equals last potential."""
+        params = self.base_params(
+            exit_potential_mode="progressive_release",
+            exit_potential_decay=-0.75,
+            hold_potential_enabled=True,
+        )
+        prev_potential = 0.42
+        total, shaping, next_potential, _pbrs_delta, _entry_additive, _exit_additive = (
+            apply_potential_shaping(
+                base_reward=0.0,
+                current_pnl=0.0,
+                pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+                current_duration_ratio=0.0,
+                next_pnl=0.0,
+                next_duration_ratio=0.0,
+                risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+                base_factor=PARAMS.BASE_FACTOR,
+                is_exit=True,
+                prev_potential=prev_potential,
+                params=params,
+            )
+        )
+        self.assertPlacesEqual(
+            next_potential, prev_potential, places=TOLERANCE.DECIMAL_PLACES_STRICT
+        )
+        raw_gamma = DEFAULT_MODEL_REWARD_PARAMETERS.get("potential_gamma", 0.95)
+        gamma_fallback = 0.95 if raw_gamma is None else raw_gamma
+        try:
+            gamma = float(gamma_fallback)
+        except Exception:
+            gamma = 0.95
+        # PBRS shaping Δ = γ·Φ(next) - Φ(prev). Here Φ(next)=Φ(prev) since decay clamps to 0.
+        self.assertLessEqual(
+            abs(shaping - ((gamma - 1.0) * prev_potential)),
+            TOLERANCE.GENERIC_EQ,
+        )
+        self.assertPlacesEqual(total, shaping, places=TOLERANCE.DECIMAL_PLACES_STRICT)
+
+    def test_potential_gamma_nan_fallback(self):
+        """Verifies potential_gamma=NaN fallback to default value."""
+        base_params_dict = self.base_params()
+        default_gamma = base_params_dict.get("potential_gamma", 0.95)
+        params_nan = self.base_params(potential_gamma=np.nan, hold_potential_enabled=True)
+        res_nan = apply_potential_shaping(
+            base_reward=0.1,
+            current_pnl=0.03,
+            pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=0.2,
+            next_pnl=0.035,
+            next_duration_ratio=0.25,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=False,
+            prev_potential=0.0,
+            params=params_nan,
+        )
+        params_ref = self.base_params(potential_gamma=default_gamma, hold_potential_enabled=True)
+        res_ref = apply_potential_shaping(
+            base_reward=0.1,
+            current_pnl=0.03,
+            pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=0.2,
+            next_pnl=0.035,
+            next_duration_ratio=0.25,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=False,
+            prev_potential=0.0,
+            params=params_ref,
+        )
+        self.assertLess(
+            abs(res_nan[1] - res_ref[1]),
+            TOLERANCE.IDENTITY_RELAXED,
+            "Unexpected shaping difference under gamma NaN fallback",
+        )
+        self.assertLess(
+            abs(res_nan[0] - res_ref[0]),
+            TOLERANCE.IDENTITY_RELAXED,
+            "Unexpected total difference under gamma NaN fallback",
+        )
+
+    def test_calculate_reward_entry_next_pnl_fee_aware(self):
+        """calculate_reward() entry PBRS uses fee-aware next_pnl estimate."""
+        params = self.base_params(
+            exit_potential_mode="non_canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.9,
+            entry_fee_rate=0.001,
+            exit_fee_rate=0.001,
+        )
+
+        for action in (Actions.Long_enter, Actions.Short_enter):
+            ctx = self.make_ctx(
+                position=Positions.Neutral, action=action, pnl=0.0, trade_duration=0
+            )
+            breakdown = calculate_reward_with_defaults(ctx, params, prev_potential=0.0)
+            self.assertFinite(float(breakdown.next_potential), name="next_potential")
+            # With any nonzero fees, immediate unrealized pnl should be negative.
+            self.assertLess(
+                breakdown.next_potential,
+                0.0,
+                f"Expected negative next_potential on entry for action={action}",
+            )
+
+    def test_fee_rates_are_clamped_to_parameter_bounds(self):
+        """Fee clamping uses _PARAMETER_BOUNDS (max 0.1)."""
+        cases = [
+            ("entry_fee_rate", self.base_params(entry_fee_rate=999.0, exit_fee_rate=0.0)),
+            ("exit_fee_rate", self.base_params(entry_fee_rate=0.0, exit_fee_rate=999.0)),
+        ]
+
+        for key, params in cases:
+            pnl_clamped = _compute_unrealized_pnl_estimate(
+                Positions.Long,
+                entry_open=1.0,
+                current_open=1.0,
+                params=params,
+            )
+            pnl_expected = _compute_unrealized_pnl_estimate(
+                Positions.Long,
+                entry_open=1.0,
+                current_open=1.0,
+                params={**params, key: 0.1},
+            )
+            self.assertAlmostEqualFloat(
+                pnl_clamped,
+                pnl_expected,
+                tolerance=TOLERANCE.IDENTITY_STRICT,
+                msg=f"Expected {key} values above max to clamp to 0.1",
+            )
+
+    def test_unrealized_pnl_estimate_uses_division_for_exit_fee(self):
+        """Exit fee uses division `open/(1+fee)`."""
+        params = self.base_params(entry_fee_rate=0.0, exit_fee_rate=0.1)
+
+        pnl_long = _compute_unrealized_pnl_estimate(
+            Positions.Long,
+            entry_open=1.0,
+            current_open=1.0,
+            params=params,
+        )
+        expected_pnl_long = (1.0 / 1.1 - 1.0) / 1.0
+        self.assertAlmostEqualFloat(
+            float(pnl_long),
+            float(expected_pnl_long),
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="Long entry PnL mismatch for division-based exit fee",
+        )
+
+        pnl_short = _compute_unrealized_pnl_estimate(
+            Positions.Short,
+            entry_open=1.0,
+            current_open=1.0,
+            params=params,
+        )
+        expected_pnl_short = (1.0 / 1.1 - 1.0) / (1.0 / 1.1)
+        self.assertAlmostEqualFloat(
+            float(pnl_short),
+            float(expected_pnl_short),
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="Short entry PnL mismatch for division-based exit fee",
+        )
+
+    def test_simulate_samples_initializes_pnl_on_entry(self):
+        """simulate_samples() sets in-position pnl to fee-aware entry estimate."""
+        params = self.base_params(
+            exit_potential_mode="non_canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            entry_fee_rate=0.001,
+            exit_fee_rate=0.001,
+        )
+
+        df = simulate_samples(
+            num_samples=80,
+            seed=1,
+            params=params,
+            base_factor=PARAMS.BASE_FACTOR,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            max_duration_ratio=1.0,
+            trading_mode="futures",
+            pnl_base_std=0.0,
+            pnl_duration_vol_scale=0.0,
+        )
+
+        enter_pos = df.reset_index(drop=True)
+        enter_mask = enter_pos["action"].to_numpy() == float(Actions.Long_enter.value)
+        enter_positions = np.flatnonzero(enter_mask)
+        self.assertGreater(len(enter_positions), 0, "Expected at least one Long_enter in sample")
+
+        first_enter_pos = int(enter_positions[0])
+        self.assertEqual(
+            float(enter_pos.iloc[first_enter_pos]["position"]),
+            float(Positions.Neutral.value),
+            "Expected Neutral position on Long_enter row",
+        )
+
+        next_pos = first_enter_pos + 1
+        self.assertLess(next_pos, len(enter_pos), "Sample must include post-entry step")
+        self.assertEqual(
+            float(enter_pos.iloc[next_pos]["position"]),
+            float(Positions.Long.value),
+            "Expected Long position immediately after Long_enter",
+        )
+
+        expected_pnl = _compute_unrealized_pnl_estimate(
+            Positions.Long,
+            entry_open=1.0,
+            current_open=1.0,
+            params=params,
+        )
+        post_entry_pnl = float(enter_pos.iloc[next_pos]["pnl"])
+        self.assertAlmostEqualFloat(
+            post_entry_pnl,
+            expected_pnl,
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="Expected pnl after entry to match entry fee estimate",
+        )
+
+    def test_calculate_reward_hold_uses_current_duration_ratio(self):
+        """calculate_reward() hold next_duration_ratio uses trade_duration."""
+        params = self.base_params(
+            exit_potential_mode="non_canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.9,
+            base_factor=PARAMS.BASE_FACTOR,
+        )
+
+        trade_duration = 5
+        max_trade_duration_candles = 10
+
+        ctx = self.make_ctx(
+            position=Positions.Long,
+            action=Actions.Neutral,
+            pnl=0.01,
+            trade_duration=trade_duration,
+        )
+
+        breakdown = calculate_reward_with_defaults(
+            ctx,
+            {**params, "max_trade_duration_candles": max_trade_duration_candles},
+            prev_potential=0.0,
+        )
+
+        expected_next_potential = _compute_hold_potential(
+            pnl=ctx.current_pnl,
+            pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            duration_ratio=(trade_duration / max_trade_duration_candles),
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            params=params,
+            base_factor=PARAMS.BASE_FACTOR,
+        )
+        self.assertAlmostEqualFloat(
+            breakdown.next_potential,
+            expected_next_potential,
+            tolerance=TOLERANCE.IDENTITY_RELAXED,
+            msg="Hold next_potential mismatch (duration ratio mismatch)",
+        )
+
+    # ---------------- Validation parameter batch & relaxed aggregation ---------------- #
+
+    def test_validate_reward_parameters_batch_and_relaxed_aggregation(self):
+        """Batch validate strict failures + relaxed multi-reason aggregation via helpers."""
+        strict_failures = [
+            build_validation_case({"potential_gamma": -0.2}, strict=True, expect_error=True),
+            build_validation_case({"hold_potential_ratio": -5.0}, strict=True, expect_error=True),
+        ]
+        success_case = build_validation_case({}, strict=True, expect_error=False)
+        relaxed_case = build_validation_case(
+            {
+                "potential_gamma": "not-a-number",
+                "hold_potential_ratio": "-5.0",
+                "max_idle_duration_candles": "nan",
+            },
+            strict=False,
+            expect_error=False,
+            expected_reason_substrings=[
+                "non_numeric_reset",
+                "numeric_coerce",
+                "min=",
+                "derived_default",
+            ],
+        )
+        execute_validation_batch(
+            self,
+            [success_case, *strict_failures, relaxed_case],
+            validate_reward_parameters,
+        )
+        params_relaxed = DEFAULT_MODEL_REWARD_PARAMETERS.copy()
+        params_relaxed.update(
+            {
+                "potential_gamma": "not-a-number",
+                "hold_potential_ratio": "-5.0",
+                "max_idle_duration_candles": "nan",
+            }
+        )
+        assert_relaxed_multi_reason_aggregation(
+            self,
+            validate_reward_parameters,
+            params_relaxed,
+            {
+                "potential_gamma": ["non_numeric_reset"],
+                "hold_potential_ratio": ["numeric_coerce", "min="],
+                "max_idle_duration_candles": ["derived_default"],
+            },
+        )
+
+    # ---------------- Exit potential mode comparisons ---------------- #
+
+    def test_compute_exit_potential_mode_differences(self):
+        """Exit potential modes: canonical vs spike_cancel shaping magnitude differences."""
+        gamma = 0.93
+        base_common = {
+            "hold_potential_enabled": True,
+            "potential_gamma": gamma,
+            "entry_additive_enabled": False,
+            "exit_additive_enabled": False,
+            "hold_potential_ratio": 1.0,
+        }
+        ctx_pnl = 0.012
+        ctx_dur_ratio = 0.3
+        params_can = self.base_params(exit_potential_mode="canonical", **base_common)
+        prev_phi = _compute_hold_potential(
+            ctx_pnl,
+            PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+            ctx_dur_ratio,
+            PARAMS.RISK_REWARD_RATIO,
+            params_can,
+            PARAMS.BASE_FACTOR,
+        )
+        self.assertFinite(prev_phi, name="prev_phi")
+        next_phi_can = _compute_exit_potential(prev_phi, params_can)
+        self.assertAlmostEqualFloat(
+            next_phi_can,
+            0.0,
+            tolerance=TOLERANCE.IDENTITY_STRICT,
+            msg="Canonical exit must zero potential",
+        )
+        canonical_delta = -prev_phi
+        self.assertAlmostEqualFloat(
+            canonical_delta,
+            -prev_phi,
+            tolerance=TOLERANCE.IDENTITY_RELAXED,
+            msg="Canonical delta mismatch",
+        )
+        params_spike = self.base_params(exit_potential_mode="spike_cancel", **base_common)
+        next_phi_spike = _compute_exit_potential(prev_phi, params_spike)
+        shaping_spike = gamma * next_phi_spike - prev_phi
+        self.assertNearZero(
+            shaping_spike,
+            atol=TOLERANCE.IDENTITY_RELAXED,
+            msg="Spike cancel should nullify shaping delta",
+        )
+        self.assertGreaterEqual(
+            abs(canonical_delta) + TOLERANCE.IDENTITY_STRICT,
+            abs(shaping_spike),
+            "Canonical shaping magnitude should exceed spike_cancel",
+        )
+
+    def test_pbrs_retain_previous_cumulative_drift(self):
+        """retain_previous mode accumulates negative shaping drift (non-invariant)."""
+        params = self.base_params(
+            exit_potential_mode="retain_previous",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.9,
+        )
+        gamma = _get_float_param(
+            params,
+            "potential_gamma",
+            DEFAULT_MODEL_REWARD_PARAMETERS.get("potential_gamma", 0.95),
+        )
+        rng = np.random.default_rng(555)
+        potentials = rng.uniform(0.05, 0.85, size=220)
+        deltas = [gamma * p - p for p in potentials]
+        cumulative = float(np.sum(deltas))
+        self.assertLess(cumulative, -TOLERANCE.NEGLIGIBLE)
+        self.assertGreater(abs(cumulative), 10 * TOLERANCE.IDENTITY_RELAXED)
+
+    def test_exit_step_shaping_matches_exit_step_rules(self):
+        """Exit step: shaping uses stored prev_potential.
+
+        For canonical mode, next_potential must be 0 and shaping_delta = -prev_potential.
+        """
+
+        params = self.base_params(
+            exit_potential_mode="canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.94,
+        )
+        prev_potential = 0.42
+        current_pnl = 0.02
+        current_dur = 0.5
+        profit_aim = PARAMS.PROFIT_AIM
+        (
+            _total_reward,
+            reward_shaping,
+            next_potential,
+            pbrs_delta,
+            _entry_additive,
+            _exit_additive,
+        ) = apply_potential_shaping(
+            base_reward=0.0,
+            current_pnl=current_pnl,
+            pnl_target=profit_aim * PARAMS.RISK_REWARD_RATIO,
+            current_duration_ratio=current_dur,
+            next_pnl=0.0,
+            next_duration_ratio=0.0,
+            base_factor=PARAMS.BASE_FACTOR,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            is_exit=True,
+            is_entry=False,
+            prev_potential=prev_potential,
+            params=params,
+        )
+        self.assertPlacesEqual(next_potential, 0.0, places=TOLERANCE.DECIMAL_PLACES_STRICT)
+        self.assertAlmostEqualFloat(
+            reward_shaping,
+            -prev_potential,
+            tolerance=TOLERANCE.IDENTITY_RELAXED,
+            msg="Canonical exit shaping should be -prev_potential",
+        )
+        self.assertAlmostEqualFloat(
+            pbrs_delta,
+            -prev_potential,
+            tolerance=TOLERANCE.IDENTITY_RELAXED,
+            msg="Canonical exit PBRS delta should be -prev_potential",
+        )
+
+    def test_invalid_action_still_applies_pbrs_shaping(self):
+        """Invalid action penalties still flow through PBRS shaping."""
+
+        params = self.base_params(
+            max_trade_duration_candles=100,
+            exit_potential_mode="canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.9,
+            base_factor=PARAMS.BASE_FACTOR,
+        )
+        pnl_target = PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO
+        ctx = self.make_ctx(
+            pnl=0.02,
+            trade_duration=10,
+            idle_duration=0,
+            max_unrealized_profit=0.03,
+            min_unrealized_profit=0.01,
+            position=Positions.Long,
+            action=Actions.Short_exit,  # invalid for long
+        )
+
+        current_duration_ratio = ctx.trade_duration / params["max_trade_duration_candles"]
+        prev_potential = _compute_hold_potential(
+            ctx.current_pnl,
+            pnl_target,
+            current_duration_ratio,
+            PARAMS.RISK_REWARD_RATIO,
+            params,
+            PARAMS.BASE_FACTOR,
+        )
+
+        self.assertNotEqual(prev_potential, 0.0)
+
+        breakdown = calculate_reward_with_defaults(
+            ctx, params, action_masking=False, prev_potential=prev_potential
+        )
+
+        expected_shaping = params["potential_gamma"] * prev_potential - prev_potential
+        self.assertAlmostEqualFloat(
+            breakdown.reward_shaping,
+            expected_shaping,
+            tolerance=TOLERANCE.IDENTITY_RELAXED,
+            msg="Invalid actions should still produce PBRS shaping",
+        )
+        self.assertAlmostEqualFloat(
+            breakdown.total,
+            breakdown.invalid_penalty
+            + breakdown.reward_shaping
+            + breakdown.entry_additive
+            + breakdown.exit_additive,
+            tolerance=TOLERANCE.IDENTITY_RELAXED,
+            msg="Total should decompose for invalid actions",
+        )
+
+    def test_simulate_samples_retains_signals_in_canonical_mode(self):
+        """simulate_samples() is not drift-corrected; it must not force Σ shaping ~ 0."""
+
+        params = self.base_params(
+            exit_potential_mode="canonical",
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            potential_gamma=0.92,
+        )
+        df = simulate_samples(
+            params={**params, "max_trade_duration_candles": 120},
+            num_samples=SCENARIOS.SAMPLE_SIZE_MEDIUM,
+            seed=SEEDS.PBRS_TERMINAL,
+            base_factor=PARAMS.BASE_FACTOR,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            max_duration_ratio=2.0,
+            trading_mode="margin",
+            pnl_base_std=PARAMS.PNL_STD,
+            pnl_duration_vol_scale=PARAMS.PNL_DUR_VOL_SCALE,
+        )
+        abs_sum = float(df["reward_shaping"].abs().sum())
+        self.assertFinite(abs_sum, name="abs_sum")
+        self.assertLessEqual(float(df["reward_shaping"].abs().max()), PBRS.MAX_ABS_SHAPING)
+        # Even with trajectories, Σ can partially cancel; use L1 magnitude instead.
+        self.assertGreater(
+            abs_sum,
+            PBRS_INVARIANCE_TOL,
+            "Expected non-trivial shaping magnitudes for canonical mode",
+        )
+
+    # ---------------- Statistical shape invariance ---------------- #
+
+    def test_normality_invariance_under_scaling(self):
+        """Skewness & excess kurtosis invariant under positive scaling of normal sample."""
+        rng = np.random.default_rng(808)
+        base = rng.normal(0.0, 1.0, size=7000)
+        scaled = 5.0 * base
+
+        def _skew_kurt(x: np.ndarray) -> tuple[float, float]:
+            m = np.mean(x)
+            c = x - m
+            m2 = np.mean(c**2)
+            m3 = np.mean(c**3)
+            m4 = np.mean(c**4)
+            skew = m3 / (m2**1.5 + TOLERANCE.NUMERIC_GUARD)
+            kurt = m4 / (m2**2 + TOLERANCE.NUMERIC_GUARD) - 3.0
+            return (float(skew), float(kurt))
+
+        s_base, k_base = _skew_kurt(base)
+        s_scaled, k_scaled = _skew_kurt(scaled)
+        self.assertAlmostEqualFloat(s_base, s_scaled, tolerance=TOLERANCE.DISTRIB_SHAPE)
+        self.assertAlmostEqualFloat(k_base, k_scaled, tolerance=TOLERANCE.DISTRIB_SHAPE)
+
+    # ---------------- Report classification / formatting ---------------- #
+
+    # Non-owning smoke; ownership: robustness/test_robustness.py:43 (robustness-decomposition-integrity-101), robustness/test_robustness.py:127 (robustness-exit-pnl-only-117)
+    @pytest.mark.smoke
+    def test_pbrs_non_canonical_report_generation(self):
+        """Synthetic invariance section: Non-canonical classification formatting."""
+
+        df = pd.DataFrame(
+            {
+                "reward_shaping": [0.01, -0.002],
+                "reward_entry_additive": [0.0, 0.0],
+                "reward_exit_additive": [0.001, 0.0],
+            }
+        )
+        total_shaping = df["reward_shaping"].sum()
+        self.assertGreater(abs(total_shaping), PBRS_INVARIANCE_TOL)
+        invariance_status = "❌ Non-canonical"
+        section = []
+        section.append("**PBRS Invariance Summary:**\n")
+        section.append("| Field | Value |\n")
+        section.append("|-------|-------|\n")
+        section.append(f"| Invariance | {invariance_status} |\n")
+        section.append(f"| Note | Total shaping = {total_shaping:.6f} (non-zero) |\n")
+        section.append(f"| Σ Shaping Reward | {total_shaping:.6f} |\n")
+        section.append(f"| Abs Σ Shaping Reward | {abs(total_shaping):.6e} |\n")
+        section.append(f"| Σ Entry Additive | {df['reward_entry_additive'].sum():.6f} |\n")
+        section.append(f"| Σ Exit Additive | {df['reward_exit_additive'].sum():.6f} |\n")
+        content = "".join(section)
+        assert_pbrs_invariance_report_classification(
+            self, content, "Non-canonical", expect_additives=False
+        )
+        self.assertRegex(content, "Σ Shaping Reward \\| 0\\.008000 \\|")
+        m_abs = re.search("Abs Σ Shaping Reward \\| ([0-9.]+e[+-][0-9]{2}) \\|", content)
+        self.assertIsNotNone(m_abs)
+        if m_abs:
+            val = float(m_abs.group(1))
+            self.assertAlmostEqual(abs(total_shaping), val, places=TOLERANCE.DECIMAL_PLACES_STRICT)
+
+    def test_potential_gamma_boundary_values_stability(self):
+        """Potential gamma boundary values (0 and ≈1) produce bounded shaping."""
+        for gamma in [0.0, 0.999999]:
+            params = self.base_params(
+                hold_potential_enabled=True,
+                entry_additive_enabled=False,
+                exit_additive_enabled=False,
+                exit_potential_mode="canonical",
+                potential_gamma=gamma,
+                hold_potential_ratio=1.0,
+            )
+            _tot, shap, next_pot, _pbrs_delta, _entry_additive, _exit_additive = (
+                apply_potential_shaping(
+                    base_reward=0.0,
+                    current_pnl=0.02,
+                    pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+                    current_duration_ratio=0.3,
+                    next_pnl=0.025,
+                    next_duration_ratio=0.35,
+                    risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+                    base_factor=PARAMS.BASE_FACTOR,
+                    is_exit=False,
+                    prev_potential=0.0,
+                    params=params,
+                )
+            )
+            self.assertFinite(float(shap), name="shaping")
+            self.assertFinite(float(next_pot), name="next_potential")
+            self.assertLessEqual(abs(shap), PBRS.MAX_ABS_SHAPING)
+
+            # With bounded transforms and hold_potential_ratio=1:
+            # |Φ(s)| <= base_factor and |Δ| <= (1+γ)*base_factor  # noqa: RUF003
+            self.assertLessEqual(abs(float(shap)), (1.0 + gamma) * PARAMS.BASE_FACTOR)
+
+    def test_report_cumulative_invariance_aggregation(self):
+        """Canonical telescoping term: small per-step mean drift, bounded increments."""
+
+        params = self.base_params(
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            exit_potential_mode="canonical",
+        )
+        gamma = _get_float_param(
+            params,
+            "potential_gamma",
+            DEFAULT_MODEL_REWARD_PARAMETERS.get("potential_gamma", 0.95),
+        )
+        rng = np.random.default_rng(321)
+        prev_potential = 0.0
+        telescoping_sum = 0.0
+        max_abs_step = 0.0
+        steps = 0
+        for _ in range(SCENARIOS.PBRS_SIMULATION_STEPS):
+            is_exit = rng.uniform() < 0.1
+            current_pnl = float(rng.normal(0, 0.05))
+            current_dur = float(rng.uniform(0, 1))
+            next_pnl = 0.0 if is_exit else float(rng.normal(0, 0.05))
+            next_dur = 0.0 if is_exit else float(rng.uniform(0, 1))
+            _tot, _shap, next_potential, _pbrs_delta, _entry_additive, _exit_additive = (
+                apply_potential_shaping(
+                    base_reward=0.0,
+                    current_pnl=current_pnl,
+                    pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+                    current_duration_ratio=current_dur,
+                    next_pnl=next_pnl,
+                    next_duration_ratio=next_dur,
+                    risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+                    base_factor=PARAMS.BASE_FACTOR,
+                    is_exit=is_exit,
+                    prev_potential=prev_potential,
+                    params=params,
+                )
+            )
+            inc = gamma * next_potential - prev_potential
+            telescoping_sum += inc
+            if abs(inc) > max_abs_step:
+                max_abs_step = abs(inc)
+            steps += 1
+            prev_potential = 0.0 if is_exit else next_potential
+        mean_drift = telescoping_sum / max(1, steps)
+        self.assertLess(
+            abs(mean_drift),
+            0.02,
+            f"Per-step telescoping drift too large (mean={mean_drift}, steps={steps})",
+        )
+        self.assertLessEqual(
+            max_abs_step,
+            PBRS.MAX_ABS_SHAPING,
+            f"Unexpected large telescoping increment (max={max_abs_step})",
+        )
+
+    def test_report_explicit_non_invariance_progressive_release(self):
+        """progressive_release cumulative shaping non-zero (release leak)."""
+
+        params = self.base_params(
+            hold_potential_enabled=True,
+            entry_additive_enabled=False,
+            exit_additive_enabled=False,
+            exit_potential_mode="progressive_release",
+            exit_potential_decay=0.25,
+        )
+        rng = np.random.default_rng(321)
+        prev_potential = 0.0
+        shaping_sum = 0.0
+
+        for _ in range(SCENARIOS.MONTE_CARLO_ITERATIONS):
+            is_exit = rng.uniform() < STATISTICAL.EXIT_PROBABILITY_THRESHOLD
+            next_pnl = 0.0 if is_exit else float(rng.normal(0, 0.07))
+            next_dur = 0.0 if is_exit else float(rng.uniform(0, 1))
+            _tot, shap, next_pot, _pbrs_delta, _entry_additive, _exit_additive = (
+                apply_potential_shaping(
+                    base_reward=0.0,
+                    current_pnl=float(rng.normal(0, 0.07)),
+                    pnl_target=PARAMS.PROFIT_AIM * PARAMS.RISK_REWARD_RATIO,
+                    current_duration_ratio=float(rng.uniform(0, 1)),
+                    next_pnl=next_pnl,
+                    next_duration_ratio=next_dur,
+                    risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+                    base_factor=PARAMS.BASE_FACTOR,
+                    is_exit=is_exit,
+                    prev_potential=prev_potential,
+                    params=params,
+                )
+            )
+            shaping_sum += shap
+            prev_potential = 0.0 if is_exit else next_pot
+        self.assertGreater(
+            abs(shaping_sum),
+            PBRS_INVARIANCE_TOL * 50,
+            f"Expected non-zero shaping (got {shaping_sum})",
+        )
+
+    # Non-owning smoke; ownership: robustness/test_robustness.py:43 (robustness-decomposition-integrity-101)
+    # Owns invariant: pbrs-canonical-near-zero-report-116
+    @pytest.mark.smoke
+    def test_pbrs_canonical_near_zero_report(self):
+        """Invariant 116: canonical near-zero cumulative shaping classified in full report."""
+
+        small_vals = [1.0e-7, -2.0e-7, 3.0e-7]  # sum = 2.0e-7 < tolerance
+        total_shaping = float(sum(small_vals))
+        self.assertLess(
+            abs(total_shaping),
+            PBRS_INVARIANCE_TOL,
+            f"Total shaping {total_shaping} exceeds invariance tolerance",
+        )
+        inv_corr_vals = [1.0e-7, -1.0e-7, 2.0e-7]
+        max_abs_corr = float(np.max(np.abs(inv_corr_vals)))
+        self.assertLess(max_abs_corr, PBRS_INVARIANCE_TOL)
+
+        n = len(small_vals)
+        df = pd.DataFrame(
+            {
+                "reward": np.random.normal(0, 1, n),
+                "reward_idle": np.zeros(n),
+                "reward_hold": np.random.normal(-0.2, 0.05, n),
+                "reward_exit": np.random.normal(0.4, 0.15, n),
+                "pnl": np.random.normal(0.01, 0.02, n),
+                "trade_duration": np.random.uniform(5, 30, n),
+                "idle_duration": np.zeros(n),
+                "position": np.random.choice([0.0, 0.5, 1.0], n),
+                "action": np.random.randint(0, 3, n),
+                "reward_shaping": small_vals,
+                "reward_entry_additive": [0.0] * n,
+                "reward_exit_additive": [0.0] * n,
+                "reward_invariance_correction": inv_corr_vals,
+                "reward_invalid": np.zeros(n),
+                "duration_ratio": np.random.uniform(0.2, 1.0, n),
+                "idle_ratio": np.zeros(n),
+            }
+        )
+        df.attrs["reward_params"] = {
+            "exit_potential_mode": "canonical",
+            "entry_additive_enabled": False,
+            "exit_additive_enabled": False,
+        }
+        out_dir = self.output_path / "canonical_near_zero_report"
+        write_complete_statistical_analysis(
+            df,
+            output_dir=out_dir,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            seed=SEEDS.BASE,
+            skip_feature_analysis=True,
+            skip_partial_dependence=True,
+            bootstrap_resamples=SCENARIOS.BOOTSTRAP_MINIMAL_ITERATIONS,
+        )
+        report_path = out_dir / "statistical_analysis.md"
+        self.assertTrue(report_path.exists(), "Report file missing for canonical near-zero test")
+        content = report_path.read_text(encoding="utf-8")
+        assert_pbrs_invariance_report_classification(
+            self, content, "Canonical", expect_additives=False
+        )
+        self.assertRegex(content, r"\| Σ Shaping Reward \| 0\.000000 \|")
+        m_abs = re.search(r"\| Abs Σ Shaping Reward \| ([0-9.]+e[+-][0-9]{2}) \|", content)
+        self.assertIsNotNone(m_abs)
+        if m_abs:
+            val_abs = float(m_abs.group(1))
+            self.assertAlmostEqual(
+                abs(total_shaping), val_abs, places=TOLERANCE.DECIMAL_PLACES_STRICT
+            )
+        self.assertIn("max|correction|≈0", content)
+
+    # Non-owning smoke; ownership: robustness/test_robustness.py:43 (robustness-decomposition-integrity-101)
+    @pytest.mark.smoke
+    def test_pbrs_canonical_suppresses_additives_in_report(self):
+        """Canonical exit mode suppresses additives for classification.
+
+        The reward engine suppresses additive terms when exit_potential_mode is "canonical".
+        The report should align: classification stays canonical and should not claim
+        non-canonical additives involvement.
+        """
+
+        small_vals = [1.0e-7, -2.0e-7, 3.0e-7]  # sum = 2.0e-7 < tolerance
+        total_shaping = float(sum(small_vals))
+        self.assertLess(abs(total_shaping), PBRS_INVARIANCE_TOL)
+        inv_corr_vals = [1.0e-7, -1.0e-7, 2.0e-7]
+        max_abs_corr = float(np.max(np.abs(inv_corr_vals)))
+        self.assertLess(max_abs_corr, PBRS_INVARIANCE_TOL)
+
+        n = len(small_vals)
+        df = pd.DataFrame(
+            {
+                "reward": np.random.normal(0, 1, n),
+                "reward_idle": np.zeros(n),
+                "reward_hold": np.random.normal(-0.2, 0.05, n),
+                "reward_exit": np.random.normal(0.4, 0.15, n),
+                "pnl": np.random.normal(0.01, 0.02, n),
+                "trade_duration": np.random.uniform(5, 30, n),
+                "idle_duration": np.zeros(n),
+                "position": np.random.choice([0.0, 0.5, 1.0], n),
+                "action": np.random.randint(0, 3, n),
+                "reward_shaping": small_vals,
+                "reward_entry_additive": [0.0] * n,
+                "reward_exit_additive": [0.0] * n,
+                "reward_invariance_correction": inv_corr_vals,
+                "reward_invalid": np.zeros(n),
+                "duration_ratio": np.random.uniform(0.2, 1.0, n),
+                "idle_ratio": np.zeros(n),
+            }
+        )
+        df.attrs["reward_params"] = {
+            "exit_potential_mode": "canonical",
+            "entry_additive_enabled": True,
+            "exit_additive_enabled": True,
+        }
+        out_dir = self.output_path / "canonical_additives_suppressed"
+        write_complete_statistical_analysis(
+            df,
+            output_dir=out_dir,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            seed=SEEDS.BASE,
+            skip_feature_analysis=True,
+            skip_partial_dependence=True,
+            bootstrap_resamples=SCENARIOS.BOOTSTRAP_MINIMAL_ITERATIONS,
+        )
+        report_path = out_dir / "statistical_analysis.md"
+        self.assertTrue(report_path.exists(), "Report file missing for canonical additives test")
+        content = report_path.read_text(encoding="utf-8")
+        assert_pbrs_invariance_report_classification(
+            self, content, "Canonical", expect_additives=False
+        )
+        self.assertIn("Additives are suppressed in canonical mode", content)
+        self.assertIn("| Entry Additive Enabled | True |", content)
+        self.assertIn("| Exit Additive Enabled | True |", content)
+        self.assertIn("| Entry Additive Effective | False |", content)
+        self.assertIn("| Exit Additive Effective | False |", content)
+
+    def test_pbrs_canonical_warning_report(self):
+        """Canonical mode + no additives but max|invariance_correction| > tolerance -> warning."""
+
+        shaping_vals = [1.2e-4, 1.3e-4, 8.0e-5, -2.0e-5, 1.4e-4]  # Σ not near 0
+        total_shaping = float(sum(shaping_vals))
+        self.assertGreater(abs(total_shaping), PBRS_INVARIANCE_TOL)
+
+        inv_corr_vals = [1.0e-4, -2.0e-4, 1.5e-4, -1.2e-4, 7.0e-5]
+        max_abs_corr = float(np.max(np.abs(inv_corr_vals)))
+        self.assertGreater(max_abs_corr, PBRS_INVARIANCE_TOL)
+
+        n = len(shaping_vals)
+        df = pd.DataFrame(
+            {
+                "reward": np.random.normal(0, 1, n),
+                "reward_idle": np.zeros(n),
+                "reward_hold": np.random.normal(-0.2, 0.1, n),
+                "reward_exit": np.random.normal(0.5, 0.2, n),
+                "pnl": np.random.normal(0.01, 0.02, n),
+                "trade_duration": np.random.uniform(5, 50, n),
+                "idle_duration": np.zeros(n),
+                "position": np.random.choice([0.0, 0.5, 1.0], n),
+                "action": np.random.randint(0, 3, n),
+                "reward_shaping": shaping_vals,
+                "reward_entry_additive": [0.0] * n,
+                "reward_exit_additive": [0.0] * n,
+                "reward_invariance_correction": inv_corr_vals,
+                "reward_invalid": np.zeros(n),
+                "duration_ratio": np.random.uniform(0.2, 1.2, n),
+                "idle_ratio": np.zeros(n),
+            }
+        )
+        df.attrs["reward_params"] = {
+            "exit_potential_mode": "canonical",
+            "entry_additive_enabled": False,
+            "exit_additive_enabled": False,
+        }
+        out_dir = self.output_path / "canonical_warning"
+        write_complete_statistical_analysis(
+            df,
+            output_dir=out_dir,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            seed=SEEDS.BASE,
+            skip_feature_analysis=True,
+            skip_partial_dependence=True,
+            bootstrap_resamples=SCENARIOS.BOOTSTRAP_MINIMAL_ITERATIONS,
+        )
+        report_path = out_dir / "statistical_analysis.md"
+        self.assertTrue(report_path.exists(), "Report file missing for canonical warning test")
+        content = report_path.read_text(encoding="utf-8")
+        assert_pbrs_invariance_report_classification(
+            self, content, "Canonical (with warning)", expect_additives=False
+        )
+        expected_corr_fragment = f"{max_abs_corr:.6e}"
+        self.assertIn(expected_corr_fragment, content)
+
+    # Non-owning smoke; ownership: robustness/test_robustness.py:43 (robustness-decomposition-integrity-101)
+    @pytest.mark.smoke
+    def test_pbrs_non_canonical_full_report_reason_aggregation(self):
+        """Full report: Non-canonical classification aggregates mode + additives reasons."""
+
+        shaping_vals = [0.02, -0.005, 0.007]
+        entry_add_vals = [0.003, 0.0, 0.004]
+        exit_add_vals = [0.001, 0.002, 0.0]
+        n = len(shaping_vals)
+        df = pd.DataFrame(
+            {
+                "reward": np.random.normal(0, 1, n),
+                "reward_idle": np.zeros(n),
+                "reward_hold": np.random.normal(-0.1, 0.05, n),
+                "reward_exit": np.random.normal(0.4, 0.15, n),
+                "pnl": np.random.normal(0.01, 0.02, n),
+                "trade_duration": np.random.uniform(5, 25, n),
+                "idle_duration": np.zeros(n),
+                "position": np.random.choice([0.0, 0.5, 1.0], n),
+                "action": np.random.randint(0, 5, n),
+                "reward_shaping": shaping_vals,
+                "reward_entry_additive": entry_add_vals,
+                "reward_exit_additive": exit_add_vals,
+                "reward_invalid": np.zeros(n),
+                "duration_ratio": np.random.uniform(0.1, 1.0, n),
+                "idle_ratio": np.zeros(n),
+            }
+        )
+        df.attrs["reward_params"] = {
+            "exit_potential_mode": "progressive_release",
+            "entry_additive_enabled": True,
+            "exit_additive_enabled": True,
+        }
+        out_dir = self.output_path / "non_canonical_full_report"
+        write_complete_statistical_analysis(
+            df,
+            output_dir=out_dir,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            seed=SEEDS.BASE,
+            skip_feature_analysis=True,
+            skip_partial_dependence=True,
+            bootstrap_resamples=SCENARIOS.BOOTSTRAP_MINIMAL_ITERATIONS,
+        )
+        report_path = out_dir / "statistical_analysis.md"
+        self.assertTrue(
+            report_path.exists(), "Report file missing for non-canonical full report test"
+        )
+        content = report_path.read_text(encoding="utf-8")
+        assert_pbrs_invariance_report_classification(
+            self, content, "Non-canonical", expect_additives=True
+        )
+        self.assertIn("exit_potential_mode='progressive_release'", content)
+
+    # Non-owning smoke; ownership: robustness/test_robustness.py:43 (robustness-decomposition-integrity-101)
+    @pytest.mark.smoke
+    def test_pbrs_non_canonical_mode_only_reason(self):
+        """Non-canonical exit mode with additives disabled -> reason excludes additive list."""
+
+        shaping_vals = [0.002, -0.0005, 0.0012]
+        total_shaping = sum(shaping_vals)
+        self.assertGreater(abs(total_shaping), PBRS_INVARIANCE_TOL)
+        n = len(shaping_vals)
+        df = pd.DataFrame(
+            {
+                "reward": np.random.normal(0, 1, n),
+                "reward_idle": np.zeros(n),
+                "reward_hold": np.random.normal(-0.15, 0.05, n),
+                "reward_exit": np.random.normal(0.3, 0.1, n),
+                "pnl": np.random.normal(0.01, 0.02, n),
+                "trade_duration": np.random.uniform(5, 40, n),
+                "idle_duration": np.zeros(n),
+                "position": np.random.choice([0.0, 0.5, 1.0], n),
+                "action": np.random.randint(0, 5, n),
+                "reward_shaping": shaping_vals,
+                "reward_entry_additive": [0.0] * n,
+                "reward_exit_additive": [0.0] * n,
+                "reward_invalid": np.zeros(n),
+                "duration_ratio": np.random.uniform(0.2, 1.2, n),
+                "idle_ratio": np.zeros(n),
+            }
+        )
+        df.attrs["reward_params"] = {
+            "exit_potential_mode": "retain_previous",
+            "entry_additive_enabled": False,
+            "exit_additive_enabled": False,
+        }
+        out_dir = self.output_path / "non_canonical_mode_only"
+        write_complete_statistical_analysis(
+            df,
+            output_dir=out_dir,
+            profit_aim=PARAMS.PROFIT_AIM,
+            risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+            seed=SEEDS.BASE,
+            skip_feature_analysis=True,
+            skip_partial_dependence=True,
+            bootstrap_resamples=SCENARIOS.BOOTSTRAP_MINIMAL_ITERATIONS,
+        )
+        report_path = out_dir / "statistical_analysis.md"
+        self.assertTrue(
+            report_path.exists(), "Report file missing for non-canonical mode-only reason test"
+        )
+        content = report_path.read_text(encoding="utf-8")
+        assert_pbrs_invariance_report_classification(
+            self, content, "Non-canonical", expect_additives=False
+        )
+        self.assertIn("exit_potential_mode='retain_previous'", content)
+
+    # Owns invariant: pbrs-absence-shift-placeholder-118
+    def test_pbrs_absence_and_distribution_shift_placeholder(self):
+        """Report generation without PBRS columns triggers absence + shift placeholder."""
+
+        n = 90
+        rng = np.random.default_rng(SEEDS.CANONICAL_SWEEP)
+        df = pd.DataFrame(
+            {
+                "reward": rng.normal(0.05, 0.02, n),
+                "reward_idle": np.concatenate(
+                    [
+                        rng.normal(-0.01, 0.003, n // 2),
+                        np.zeros(n - n // 2),
+                    ]
+                ),
+                "reward_hold": rng.normal(0.0, 0.01, n),
+                "reward_exit": rng.normal(0.04, 0.015, n),
+                "pnl": rng.normal(0.0, 0.05, n),
+                "trade_duration": rng.uniform(5, 25, n),
+                "idle_duration": rng.uniform(1, 20, n),
+                "position": rng.choice([0.0, 0.5, 1.0], n),
+                "action": rng.integers(0, 3, n),
+                "reward_invalid": np.zeros(n),
+                "duration_ratio": rng.uniform(0.2, 1.0, n),
+                "idle_ratio": rng.uniform(0.0, 0.8, n),
+            }
+        )
+        out_dir = self.output_path / "pbrs_absence_and_shift_placeholder"
+        original_compute_summary_stats = reward_space_analysis._compute_summary_stats
+
+        def _minimal_summary_stats(_df):
+            comp_share = pd.Series([], dtype=float)
+            action_summary = pd.DataFrame(
+                columns=pd.Index(["count", "mean", "std", "min", "max"]),
+                index=pd.Index([], name="action"),
+            )
+            component_bounds = pd.DataFrame(
+                columns=pd.Index(["component_min", "component_mean", "component_max"]),
+                index=pd.Index([], name="component"),
+            )
+            global_stats = pd.Series([], dtype=float)
+            return {
+                "global_stats": global_stats,
+                "action_summary": action_summary,
+                "component_share": comp_share,
+                "component_bounds": component_bounds,
+            }
+
+        reward_space_analysis._compute_summary_stats = _minimal_summary_stats
+        try:
+            write_complete_statistical_analysis(
+                df,
+                output_dir=out_dir,
+                profit_aim=PARAMS.PROFIT_AIM,
+                risk_reward_ratio=PARAMS.RISK_REWARD_RATIO,
+                seed=SEEDS.BASE,
+                skip_feature_analysis=True,
+                skip_partial_dependence=True,
+                bootstrap_resamples=SCENARIOS.BOOTSTRAP_MINIMAL_ITERATIONS // 2,
+            )
+        finally:
+            reward_space_analysis._compute_summary_stats = original_compute_summary_stats
+        report_path = out_dir / "statistical_analysis.md"
+        self.assertTrue(report_path.exists(), "Report file missing for PBRS absence test")
+        content = report_path.read_text(encoding="utf-8")
+        self.assertIn("_PBRS components not present in this analysis._", content)
+        self.assertIn("_Not performed (no real episodes provided)._", content)
+
+    def test_get_max_idle_duration_candles_negative_or_zero_fallback(self):
+        """Explicit mid<=0 fallback path returns derived default multiplier."""
+        base = DEFAULT_MODEL_REWARD_PARAMETERS.copy()
+        base["max_trade_duration_candles"] = 64
+        base["max_idle_duration_candles"] = 0
+        result = get_max_idle_duration_candles(base)
+        expected = DEFAULT_IDLE_DURATION_MULTIPLIER * 64
+        self.assertEqual(
+            result, expected, f"Expected fallback {expected} for mid<=0 (got {result})"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

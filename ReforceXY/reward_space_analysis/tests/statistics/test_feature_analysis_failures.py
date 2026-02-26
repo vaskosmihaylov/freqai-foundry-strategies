@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Targeted tests for _perform_feature_analysis failure and edge paths.
+
+Covers early stub returns and guarded exception branches to raise coverage:
+- Missing reward column
+- Empty frame
+- Single usable feature (<2 features path)
+- NaNs present after preprocessing (>=2 features path)
+- Model fitting failure (monkeypatched fit)
+- Permutation importance failure (monkeypatched permutation_importance) while partial dependence still computed
+- Successful partial dependence computation path (not skipped)
+- scikit-learn import fallback (RandomForestRegressor/train_test_split/permutation_importance/r2_score unavailable)
+"""
+
+import builtins
+import importlib
+import sys
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from reward_space_analysis import RandomForestRegressor, _perform_feature_analysis  # type: ignore
+from tests.constants import SEEDS
+
+pytestmark = pytest.mark.statistics
+
+
+def _minimal_df(n: int = 30) -> pd.DataFrame:
+    rng = np.random.default_rng(SEEDS.BASE)
+    return pd.DataFrame(
+        {
+            "pnl": rng.normal(0, 1, n),
+            "trade_duration": rng.integers(1, 10, n),
+            "idle_duration": rng.integers(1, 5, n),
+            "position": rng.choice([0.0, 1.0], n),
+            "action": rng.integers(0, 3, n),
+            "is_invalid": rng.choice([0, 1], n),
+            "duration_ratio": rng.random(n),
+            "idle_ratio": rng.random(n),
+            "reward": rng.normal(0, 1, n),
+        }
+    )
+
+
+def test_feature_analysis_missing_reward_column():
+    """Verify feature analysis handles missing reward column gracefully.
+
+    **Setup:**
+    - DataFrame with reward column removed
+    - skip_partial_dependence: True
+
+    **Assertions:**
+    - importance_df is empty
+    - model_fitted is False
+    - n_features is 0
+    - model is None
+    """
+    df = _minimal_df().drop(columns=["reward"])  # remove reward
+    importance_df, stats, partial_deps, model = _perform_feature_analysis(
+        df, seed=SEEDS.FEATURE_EMPTY, skip_partial_dependence=True
+    )
+    assert importance_df.empty
+    assert stats["model_fitted"] is False
+    assert stats["n_features"] == 0
+    assert partial_deps == {}
+    assert model is None
+
+
+def test_feature_analysis_empty_frame():
+    """Verify feature analysis handles empty DataFrame gracefully.
+
+    **Setup:**
+    - DataFrame with 0 rows
+    - skip_partial_dependence: True
+
+    **Assertions:**
+    - importance_df is empty
+    - n_features is 0
+    - model is None
+    """
+    df = _minimal_df(0)  # empty
+    importance_df, stats, _partial_deps, model = _perform_feature_analysis(
+        df, seed=SEEDS.FEATURE_EMPTY, skip_partial_dependence=True
+    )
+    assert importance_df.empty
+    assert stats["n_features"] == 0
+    assert model is None
+
+
+def test_feature_analysis_single_feature_path():
+    """Verify feature analysis handles single feature DataFrame (stub path).
+
+    **Setup:**
+    - DataFrame with only 1 feature (pnl)
+    - skip_partial_dependence: True
+
+    **Assertions:**
+    - n_features is 1
+    - importance_mean is all NaN (stub path for single feature)
+    - model is None
+    """
+    rng = np.random.default_rng(SEEDS.FEATURE_PRIME_11)
+    df = pd.DataFrame({"pnl": rng.normal(0, 1, 25), "reward": rng.normal(0, 1, 25)})
+    importance_df, stats, _partial_deps, model = _perform_feature_analysis(
+        df, seed=SEEDS.FEATURE_PRIME_11, skip_partial_dependence=True
+    )
+    assert stats["n_features"] == 1
+    # Importance stub path returns NaNs
+    assert bool(importance_df["importance_mean"].isna().all())
+    assert model is None
+
+
+def test_feature_analysis_nans_present_path():
+    """Verify feature analysis handles NaN values in features (stub path).
+
+    **Setup:**
+    - DataFrame with NaN values in trade_duration column
+    - 40 rows with alternating NaN values
+    - skip_partial_dependence: True
+
+    **Assertions:**
+    - model_fitted is False (NaN stub path)
+    - importance_mean is all NaN
+    - model is None
+    """
+    rng = np.random.default_rng(SEEDS.FEATURE_PRIME_7)
+    df = pd.DataFrame(
+        {
+            "pnl": rng.normal(0, 1, 40),
+            "trade_duration": [1.0, np.nan] * 20,  # introduces NaNs but not wholly NaN column
+            "reward": rng.normal(0, 1, 40),
+        }
+    )
+    importance_df, stats, _partial_deps, model = _perform_feature_analysis(
+        df, seed=SEEDS.FEATURE_PRIME_13, skip_partial_dependence=True
+    )
+    # Should hit NaN stub path (model_fitted False)
+    assert stats["model_fitted"] is False
+    assert bool(importance_df["importance_mean"].isna().all())
+    assert model is None
+
+
+def test_feature_analysis_model_fitting_failure(monkeypatch):
+    """Verify feature analysis handles model fitting failure gracefully.
+
+    Uses monkeypatch to force RandomForestRegressor.fit() to raise RuntimeError,
+    simulating model fitting failure.
+
+    **Setup:**
+    - Monkeypatch RandomForestRegressor.fit to raise RuntimeError
+    - DataFrame with 50 rows
+    - skip_partial_dependence: True
+
+    **Assertions:**
+    - model_fitted is False
+    - model is None
+    - importance_mean is all NaN
+    """
+    # Monkeypatch model fit to raise
+    if RandomForestRegressor is None:  # type: ignore[comparison-overlap]
+        pytest.skip("sklearn components unavailable; skipping model fitting failure test")
+
+    def boom(self, *a, **kw):
+        raise RuntimeError("forced fit failure")
+
+    monkeypatch.setattr(RandomForestRegressor, "fit", boom)
+    df = _minimal_df(50)
+    importance_df, stats, _partial_deps, model = _perform_feature_analysis(
+        df, seed=SEEDS.FEATURE_PRIME_21, skip_partial_dependence=True
+    )
+    assert stats["model_fitted"] is False
+    assert model is None
+    assert bool(importance_df["importance_mean"].isna().all())
+    # Restore (pytest monkeypatch will revert automatically at teardown)
+
+
+def test_feature_analysis_permutation_failure_partial_dependence(monkeypatch):
+    """Verify feature analysis handles permutation_importance failure with partial dependence enabled.
+
+    Uses monkeypatch to force permutation_importance to raise RuntimeError,
+    while allowing partial dependence calculation to proceed.
+
+    **Setup:**
+    - Monkeypatch permutation_importance to raise RuntimeError
+    - DataFrame with 60 rows
+    - skip_partial_dependence: False
+
+    **Assertions:**
+    - model_fitted is True (model fits successfully)
+    - importance_mean is all NaN (permutation failed)
+    - partial_deps has at least 1 entry (PD still computed)
+    - model is not None
+    """
+
+    # Monkeypatch permutation_importance to raise while allowing partial dependence
+    def perm_boom(*a, **kw):
+        raise RuntimeError("forced permutation failure")
+
+    monkeypatch.setattr("reward_space_analysis.permutation_importance", perm_boom)
+    df = _minimal_df(60)
+    importance_df, stats, partial_deps, model = _perform_feature_analysis(
+        df, seed=SEEDS.FEATURE_PRIME_33, skip_partial_dependence=False
+    )
+    assert stats["model_fitted"] is True
+    # Importance should be NaNs due to failure
+    assert bool(importance_df["importance_mean"].isna().all())
+    # Partial dependencies should still attempt and produce entries for available features listed in function
+    assert len(partial_deps) >= 1  # at least one PD computed
+    assert model is not None
+
+
+def test_feature_analysis_success_partial_dependence():
+    """Verify feature analysis succeeds with partial dependence enabled.
+
+    Happy path test with sufficient data and all components working.
+
+    **Setup:**
+    - DataFrame with 70 rows
+    - skip_partial_dependence: False
+
+    **Assertions:**
+    - At least one non-NaN importance value
+    - model_fitted is True
+    - partial_deps has at least 1 entry
+    - model is not None
+    """
+    df = _minimal_df(70)
+    importance_df, stats, partial_deps, model = _perform_feature_analysis(
+        df, seed=SEEDS.FEATURE_PRIME_47, skip_partial_dependence=False
+    )
+    # Expect at least one non-NaN importance (model fitted path)
+    assert bool(importance_df["importance_mean"].notna().any())
+    assert stats["model_fitted"] is True
+    assert len(partial_deps) >= 1
+    assert model is not None
+
+
+def test_feature_analysis_import_fallback(monkeypatch):
+    """Simulate scikit-learn components unavailable to hit ImportError early raise."""
+    # Set any one (or all) of the guarded sklearn symbols to None; function should fast-fail.
+    monkeypatch.setattr("reward_space_analysis.RandomForestRegressor", None)
+    monkeypatch.setattr("reward_space_analysis.train_test_split", None)
+    monkeypatch.setattr("reward_space_analysis.permutation_importance", None)
+    monkeypatch.setattr("reward_space_analysis.r2_score", None)
+    df = _minimal_df(10)
+    with pytest.raises(ImportError):
+        _perform_feature_analysis(df, seed=SEEDS.FEATURE_SMALL_5, skip_partial_dependence=True)
+
+
+def test_module_level_sklearn_import_failure_reload():
+    """Force module-level sklearn import failure to execute fallback block (lines 32-42).
+
+    Strategy:
+    - Temporarily monkeypatch builtins.__import__ to raise on any 'sklearn' import.
+    - Remove 'reward_space_analysis' from sys.modules and re-import to trigger try/except.
+    - Assert guarded sklearn symbols are None (fallback assigned) in newly loaded module.
+    - Call its _perform_feature_analysis to confirm ImportError path surfaces.
+    - Restore original importer and original module to avoid side-effects on other tests.
+    """
+    orig_mod = sys.modules.get("reward_space_analysis")
+    orig_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name.startswith("sklearn"):
+            raise RuntimeError("forced sklearn import failure")
+        return orig_import(name, *args, **kwargs)
+
+    builtins.__import__ = fake_import
+    try:
+        # Drop existing module to force fresh execution of top-level imports
+        if "reward_space_analysis" in sys.modules:
+            del sys.modules["reward_space_analysis"]
+        reloaded_module = importlib.import_module("reward_space_analysis")
+
+        # Fallback assigns sklearn symbols to None
+        assert reloaded_module.RandomForestRegressor is None
+        assert reloaded_module.train_test_split is None
+        assert reloaded_module.permutation_importance is None
+        assert reloaded_module.r2_score is None
+        # Perform feature analysis should raise ImportError under missing components
+        df = _minimal_df(15)
+        with pytest.raises(ImportError):
+            reloaded_module._perform_feature_analysis(
+                df, seed=SEEDS.FEATURE_SMALL_3, skip_partial_dependence=True
+            )  # type: ignore[attr-defined]
+    finally:
+        # Restore importer
+        builtins.__import__ = orig_import
+        # Restore original module state if it existed
+        if orig_mod is not None:
+            sys.modules["reward_space_analysis"] = orig_mod
+        else:
+            if "reward_space_analysis" in sys.modules:
+                del sys.modules["reward_space_analysis"]
+            importlib.import_module("reward_space_analysis")

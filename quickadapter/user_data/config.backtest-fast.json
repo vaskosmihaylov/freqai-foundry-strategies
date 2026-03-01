@@ -1,9 +1,8 @@
 {
-  "max_open_trades": 3,
+  "max_open_trades": 1,
   "exchange": {
     "pair_whitelist": [
-      "BTC/USDT:USDT",
-      "ETH/USDT:USDT"
+      "BTC/USDT:USDT"
     ]
   },
   "pairlists": [
@@ -13,10 +12,10 @@
   ],
   "freqai": {
     "identifier": "quickadapter-xgboost-futures-fastcheck",
-    "train_period_days": 30,
-    "backtest_period_days": 30,
-    "fit_live_predictions_candles": 288,
-    "data_kitchen_thread_count": 2,
+    "train_period_days": 14,
+    "backtest_period_days": 14,
+    "fit_live_predictions_candles": 144,
+    "data_kitchen_thread_count": 1,
     "optuna_hyperopt": {
       "enabled": false,
       "n_jobs": 1,
@@ -30,15 +29,16 @@
       "include_timeframes": [
         "5m"
       ],
-      "include_shifted_candles": 2,
+      "include_shifted_candles": 1,
       "indicator_periods_candles": [
         8,
         16
       ],
-      "buffer_train_data_candles": 50
+      "buffer_train_data_candles": 20
     },
     "model_training_parameters": {
-      "n_jobs": 4,
+      "device": "cpu",
+      "n_jobs": 2,
       "verbosity": 0
     }
   }

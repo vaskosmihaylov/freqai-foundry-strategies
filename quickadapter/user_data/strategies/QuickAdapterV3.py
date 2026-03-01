@@ -639,9 +639,25 @@ class QuickAdapterV3(IStrategy):
             length=14,
             scalar=2,
         )
-        dataframe["kc_lowerband"] = kc["KCLe_14_2.0"]
-        dataframe["kc_middleband"] = kc["KCBe_14_2.0"]
-        dataframe["kc_upperband"] = kc["KCUe_14_2.0"]
+        if kc is None or kc.empty:
+            # pandas_ta can return None for very short frames (e.g. tail(1) during
+            # backtesting prediction cache warmup). Keep feature columns present.
+            kc_lower = Series(np.nan, index=dataframe.index, dtype=float)
+            kc_middle = Series(np.nan, index=dataframe.index, dtype=float)
+            kc_upper = Series(np.nan, index=dataframe.index, dtype=float)
+        else:
+            kc_lower = kc.get("KCLe_14_2.0")
+            kc_middle = kc.get("KCBe_14_2.0")
+            kc_upper = kc.get("KCUe_14_2.0")
+            if kc_lower is None:
+                kc_lower = Series(np.nan, index=dataframe.index, dtype=float)
+            if kc_middle is None:
+                kc_middle = Series(np.nan, index=dataframe.index, dtype=float)
+            if kc_upper is None:
+                kc_upper = Series(np.nan, index=dataframe.index, dtype=float)
+        dataframe["kc_lowerband"] = kc_lower
+        dataframe["kc_middleband"] = kc_middle
+        dataframe["kc_upperband"] = kc_upper
         dataframe["%-kc_width"] = (
             dataframe["kc_upperband"] - dataframe["kc_lowerband"]
         ) / dataframe["kc_middleband"]

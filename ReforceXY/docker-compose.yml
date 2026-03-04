@@ -1,4 +1,12 @@
 ---
+# Base compose profile (CPU/default).
+# Windows + NVIDIA GPU variant:
+#   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml run --rm freqtrade <command>
+# WSL + Bybit futures top-30 (dual-run profile):
+#   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-dualrun.yml up -d --build
+# WSL + Bybit futures top-30 (Optuna profile):
+#   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-optuna.yml up -d --build
 services:
   freqtrade:
     # image: freqtradeorg/freqtrade:stable_freqairl

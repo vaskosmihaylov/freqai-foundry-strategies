@@ -1,0 +1,18 @@
+{
+  "freqai": {
+    "optuna_hyperopt": {
+      "enabled": true,
+      "n_jobs": 1,
+      "n_trials": 15,
+      "n_startup_trials": 5,
+      "timeout": 1800,
+      "storage": "file",
+      "sampler": "tpe",
+      "label_sampler": "auto",
+      "continuous": false,
+      "warm_start": true,
+      "space_reduction": true,
+      "space_fraction": 0.25
+    }
+  }
+}

@@ -1,0 +1,20 @@
+---
+services:
+  freqtrade:
+    container_name: qa_dryrun_top30_optuna
+    command:
+      - trade
+      - --config
+      - user_data/config.json
+      - --config
+      - /freqtrade/configs/pairlist-static-bybit-futures-usdt-top30.json
+      - --config
+      - user_data/config.windows-gpu.json
+      - --config
+      - user_data/config.dryrun-wsl-top30-dualrun.json
+      - --config
+      - user_data/config.optuna-wsl-top30.json
+      - --strategy-path
+      - user_data/strategies
+      - --strategy
+      - QuickAdapterV3

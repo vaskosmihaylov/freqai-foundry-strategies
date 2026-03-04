@@ -1,0 +1,14 @@
+---
+services:
+  freqtrade:
+    container_name: reforcexy_dryrun_top30_optuna
+    command:
+      - trade
+      - --config
+      - user_data/config.json
+      - --config
+      - user_data/config.optuna.json
+      - --strategy-path
+      - user_data/strategies
+      - --strategy
+      - RLAgentStrategy

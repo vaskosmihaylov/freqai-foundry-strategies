@@ -162,3 +162,34 @@ From each strategy directory:
 ```bash
 docker compose down
 ```
+
+ How to run Optuna properly (QuickAdapter only)
+
+  1. Keep ReforceXY running as-is.
+  2. Stop QuickAdapter dual-run profile:
+
+  cd /home/vasko/freqai-foundry-strategies/quickadapter
+  docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-dualrun.yml down
+
+  3. Start QuickAdapter Optuna profile:
+
+  docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-optuna.yml up -d --build
+
+  4. Watch tuning progress:
+
+  docker logs -f qa_dryrun_top30_optuna | rg -i "optuna|hyperopt|best params|starting training|done training"
+
+  5. After session finishes (or after your timeout window), switch back to trading profile:
+
+  docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-optuna.yml down
+  docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-dualrun.yml up -d --build
+
+   1. Watch these markers in logs:
+
+  docker logs -f qa_dryrun_top30_optuna 2>&1 | rg -i "Starting training|Done training|Optuna .*objective hyperopt started|Optuna .*objective hyperopt completed"
+
+  2. Completion signal is:
+
+  - for each pair/namespace, you see Optuna ... started then Optuna ... completed
+  - then Done training <PAIR>
+  - then only normal heartbeat logs continue.

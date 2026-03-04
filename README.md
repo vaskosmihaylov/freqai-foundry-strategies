@@ -224,6 +224,87 @@ _Cronjob setup (daily check at 3:00 AM):_
 0 3 * * * cd /path/to/freqai-strategies/ReforceXY && ./docker-upgrade.sh >> user_data/logs/docker-upgrade.log 2>&1
 ```
 
+## WSL dual-run profiles (Bybit top-30)
+
+This repository includes Docker Compose override profiles tuned for running
+QuickAdapter and ReforceXY together on Docker Desktop + WSL2 with one NVIDIA
+GPU.
+
+### Added config and profile files
+
+- Shared top-30 pairlist:
+  [`configs/pairlist-static-bybit-futures-usdt-top30.json`](./configs/pairlist-static-bybit-futures-usdt-top30.json)
+- QuickAdapter dual-run config (Optuna off):
+  [`quickadapter/user_data/config.dryrun-wsl-top30-dualrun.json`](./quickadapter/user_data/config.dryrun-wsl-top30-dualrun.json)
+- QuickAdapter Optuna override:
+  [`quickadapter/user_data/config.optuna-wsl-top30.json`](./quickadapter/user_data/config.optuna-wsl-top30.json)
+- QuickAdapter dual-run compose profile:
+  [`quickadapter/docker-compose.wsl-top30-dualrun.yml`](./quickadapter/docker-compose.wsl-top30-dualrun.yml)
+- QuickAdapter Optuna compose profile:
+  [`quickadapter/docker-compose.wsl-top30-optuna.yml`](./quickadapter/docker-compose.wsl-top30-optuna.yml)
+- ReforceXY runtime config (Optuna off):
+  [`ReforceXY/user_data/config.json`](./ReforceXY/user_data/config.json)
+- ReforceXY Optuna override:
+  [`ReforceXY/user_data/config.optuna.json`](./ReforceXY/user_data/config.optuna.json)
+- ReforceXY GPU compose override:
+  [`ReforceXY/docker-compose.windows-gpu.yml`](./ReforceXY/docker-compose.windows-gpu.yml)
+- ReforceXY dual-run compose profile:
+  [`ReforceXY/docker-compose.wsl-top30-dualrun.yml`](./ReforceXY/docker-compose.wsl-top30-dualrun.yml)
+- ReforceXY Optuna compose profile:
+  [`ReforceXY/docker-compose.wsl-top30-optuna.yml`](./ReforceXY/docker-compose.wsl-top30-optuna.yml)
+
+### Start both strategies (dual-run baseline)
+
+Use this for normal dry-run/live operation where stability and resource headroom
+matter more than hyperparameter search.
+
+```shell
+# Terminal 1
+cd quickadapter
+docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-dualrun.yml up -d --build
+
+# Terminal 2
+cd ../ReforceXY
+docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-dualrun.yml up -d --build
+```
+
+### Start with Optuna profile (tuning sessions)
+
+Optuna profiles enable automated hyperparameter optimization (HPO). Use them
+only when you intentionally want to spend compute to search better model
+parameters.
+
+```shell
+# QuickAdapter + Optuna
+cd quickadapter
+docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-optuna.yml up -d --build
+
+# ReforceXY + Optuna
+cd ../ReforceXY
+docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-optuna.yml up -d --build
+```
+
+### When to use Optuna profiles
+
+Use Optuna profiles when:
+
+- onboarding a new strategy/model variant;
+- changing timeframe, feature set, reward function or market universe;
+- running scheduled parameter refreshes (for example weekly), not continuously.
+
+Avoid Optuna profiles for always-on concurrent bots because HPO adds trial loops
+and repeated trainings, which increases CPU/GPU/RAM pressure and can delay
+inference/retraining cadence.
+
+### Container naming and ports
+
+- QuickAdapter top-30 dual-run container: `qa_dryrun_top30_dualrun` (API `8081`)
+- QuickAdapter top-30 Optuna container: `qa_dryrun_top30_optuna` (API `8081`)
+- ReforceXY top-30 dual-run container: `reforcexy_dryrun_top30_dualrun` (API `8082`)
+- ReforceXY top-30 Optuna container: `reforcexy_dryrun_top30_optuna` (API `8082`)
+
+If another container already binds `8081` or `8082`, stop it first.
+
 ---
 
 ## Note

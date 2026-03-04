@@ -1,0 +1,24 @@
+{
+  "freqai": {
+    "rl_config": {
+      "train_cycles": 6,
+      "n_envs": 1,
+      "n_eval_envs": 1,
+      "multiprocessing": false,
+      "eval_multiprocessing": false,
+      "frame_stacking": 0,
+      "check_envs": false
+    },
+    "rl_config_optuna": {
+      "enabled": true,
+      "n_trials": 15,
+      "n_startup_trials": 5,
+      "timeout_hours": 0.5,
+      "continuous": false,
+      "warm_start": true,
+      "sampler": "tpe",
+      "storage": "file",
+      "seed": 42
+    }
+  }
+}

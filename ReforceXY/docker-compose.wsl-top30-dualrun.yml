@@ -1,0 +1,12 @@
+---
+services:
+  freqtrade:
+    container_name: reforcexy_dryrun_top30_dualrun
+    command:
+      - trade
+      - --config
+      - user_data/config.json
+      - --strategy-path
+      - user_data/strategies
+      - --strategy
+      - RLAgentStrategy

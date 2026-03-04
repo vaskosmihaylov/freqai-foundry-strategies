@@ -1,0 +1,49 @@
+{
+  "exchange": {
+    "name": "bybit",
+    "pair_whitelist": [
+      "BTC/USDT:USDT",
+      "ETH/USDT:USDT",
+      "SOL/USDT:USDT",
+      "BNB/USDT:USDT",
+      "BCH/USDT:USDT",
+      "ZEC/USDT:USDT",
+      "HYPE/USDT:USDT",
+      "TAO/USDT:USDT",
+      "AAVE/USDT:USDT",
+      "XMR/USDT:USDT",
+      "LTC/USDT:USDT",
+      "RIVER/USDT:USDT",
+      "YFI/USDT:USDT",
+      "XRP/USDT:USDT",
+      "LINK/USDT:USDT",
+      "AVAX/USDT:USDT",
+      "VVV/USDT:USDT",
+      "DASH/USDT:USDT",
+      "DOT/USDT:USDT",
+      "NEAR/USDT:USDT",
+      "UNI/USDT:USDT",
+      "ENSO/USDT:USDT",
+      "SUI/USDT:USDT",
+      "ETC/USDT:USDT",
+      "TRUMP/USDT:USDT",
+      "POWER/USDT:USDT",
+      "BARD/USDT:USDT",
+      "ICP/USDT:USDT",
+      "GIGGLE/USDT:USDT",
+      "PIPPIN/USDT:USDT"
+    ]
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    },
+    {
+      "method": "FullTradesFilter"
+    },
+    {
+      "method": "SpreadFilter",
+      "max_spread_ratio": 0.005
+    }
+  ]
+}

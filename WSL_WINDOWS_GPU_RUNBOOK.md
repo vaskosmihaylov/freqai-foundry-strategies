@@ -124,6 +124,22 @@ Good starting values:
 
 If system is stable and cool, increase gradually. Do not change many knobs at once.
 
+## 5.1 Current QuickAdapter dry-run profile (local)
+
+Current working stack (GPU + dry-run + allpairs):
+
+```bash
+docker exec qa_dryrun_allpairs sh -lc 'tr "\0" " " </proc/1/cmdline; echo'
+```
+
+Expected key runtime settings:
+- `dry_run = true`
+- `freqai.model_training_parameters.device = "cuda"`
+- `freqai.model_training_parameters.n_jobs = 8`
+- `freqai.data_kitchen_thread_count = 4`
+- Strategy hard stoploss floor in `QuickAdapterV3`: `stoploss = -0.99`
+- Custom stoploss remains enabled (`use_custom_stoploss = true`)
+
 ## 6. Troubleshooting
 
 ### GPU not detected in container

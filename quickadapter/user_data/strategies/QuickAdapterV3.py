@@ -114,7 +114,7 @@ class QuickAdapterV3(IStrategy):
     timeframe = "5m"
     timeframe_minutes = timeframe_to_minutes(timeframe)
 
-    stoploss = -0.99
+    stoploss = -0.025
     use_custom_stoploss = True
 
     default_exit_thresholds: ClassVar[dict[str, float]] = {

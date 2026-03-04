@@ -296,6 +296,27 @@ Avoid Optuna profiles for always-on concurrent bots because HPO adds trial loops
 and repeated trainings, which increases CPU/GPU/RAM pressure and can delay
 inference/retraining cadence.
 
+### Best-practice usage
+
+- Keep both strategies on dual-run profiles for day-to-day operation.
+- Run Optuna for one strategy at a time, not both simultaneously.
+- After an Optuna run completes, switch that strategy back to dual-run profile.
+- Re-run Optuna immediately after significant config changes:
+  pairlist, timeframe(s), feature set, reward logic, model type, or major market
+  regime shifts.
+- If configs stay stable, use periodic refresh windows:
+  QuickAdapter every 1-2 weeks; ReforceXY every 2-4 weeks.
+
+### ReforceXY Optuna recommendation
+
+Run ReforceXY Optuna only after the current dual-run baseline has stabilized and
+you have enough fresh data on the top-30 universe. In practice:
+
+- wait for at least one full retrain cycle and observe baseline behavior;
+- start with the provided light Optuna profile
+  ([`ReforceXY/user_data/config.optuna.json`](./ReforceXY/user_data/config.optuna.json));
+- prefer short, supervised tuning sessions over always-on HPO.
+
 ### Container naming and ports
 
 - QuickAdapter top-30 dual-run container: `qa_dryrun_top30_dualrun` (API `8081`)

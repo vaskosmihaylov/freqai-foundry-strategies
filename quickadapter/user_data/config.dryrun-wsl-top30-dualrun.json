@@ -1,5 +1,5 @@
 {
-  "max_open_trades": 4,
+  "max_open_trades": 10,
   "exchange": {
     "pair_whitelist": [
       "BTC/USDT:USDT",

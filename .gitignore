@@ -389,3 +389,4 @@ config.json
 */openspec/**
 */.sisyphus/
 */.sisyphus/**
+.serena/

@@ -224,7 +224,7 @@ _Cronjob setup (daily check at 3:00 AM):_
 0 3 * * * cd /path/to/freqai-strategies/ReforceXY && ./docker-upgrade.sh >> user_data/logs/docker-upgrade.log 2>&1
 ```
 
-## WSL dual-run profiles (Bybit top-30)
+## WSL dual-run profiles (Bybit futures shared universe)
 
 This repository includes Docker Compose override profiles tuned for running
 QuickAdapter and ReforceXY together on Docker Desktop + WSL2 with one NVIDIA
@@ -232,7 +232,7 @@ GPU.
 
 ### Added config and profile files
 
-- Shared top-30 pairlist:
+- Shared static futures pairlist (75 pairs):
   [`configs/pairlist-static-bybit-futures-usdt-top30.json`](./configs/pairlist-static-bybit-futures-usdt-top30.json)
 - QuickAdapter dual-run config (Optuna off):
   [`quickadapter/user_data/config.dryrun-wsl-top30-dualrun.json`](./quickadapter/user_data/config.dryrun-wsl-top30-dualrun.json)
@@ -252,6 +252,14 @@ GPU.
   [`ReforceXY/docker-compose.wsl-top30-dualrun.yml`](./ReforceXY/docker-compose.wsl-top30-dualrun.yml)
 - ReforceXY Optuna compose profile:
   [`ReforceXY/docker-compose.wsl-top30-optuna.yml`](./ReforceXY/docker-compose.wsl-top30-optuna.yml)
+
+The shared pairlist config above is loaded by both strategies and applied last
+in the dual-run and Optuna profile commands, so the whitelist and pairlist
+handlers come from this single source of truth.
+
+Current dual-run leverage baseline is `3x` for both strategies (configured in
+`quickadapter/user_data/config.dryrun-wsl-top30-dualrun.json` and
+`ReforceXY/user_data/config.json`).
 
 ### Start both strategies (dual-run baseline)
 
@@ -310,7 +318,7 @@ inference/retraining cadence.
 ### ReforceXY Optuna recommendation
 
 Run ReforceXY Optuna only after the current dual-run baseline has stabilized and
-you have enough fresh data on the top-30 universe. In practice:
+you have enough fresh data on the shared futures universe. In practice:
 
 - wait for at least one full retrain cycle and observe baseline behavior;
 - start with the provided light Optuna profile

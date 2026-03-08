@@ -8,6 +8,8 @@ services:
       - user_data/config.json
       - --config
       - user_data/config.optuna.json
+      - --config
+      - /freqtrade/configs/pairlist-static-bybit-futures-usdt-top30.json
       - --strategy-path
       - user_data/strategies
       - --strategy

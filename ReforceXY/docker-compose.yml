@@ -3,9 +3,9 @@
 # Windows + NVIDIA GPU variant:
 #   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml up -d
 #   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml run --rm freqtrade <command>
-# WSL + Bybit futures top-30 (dual-run profile):
+# WSL + Bybit futures shared universe (dual-run profile):
 #   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-dualrun.yml up -d --build
-# WSL + Bybit futures top-30 (Optuna profile):
+# WSL + Bybit futures shared universe (Optuna profile):
 #   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-optuna.yml up -d --build
 services:
   freqtrade:
@@ -32,6 +32,7 @@ services:
       - TZ=Europe/Paris
     volumes:
       - "./user_data:/freqtrade/user_data"
+      - "../configs:/freqtrade/configs:ro"
     # Expose api on port 8082
     # Please read the https://www.freqtrade.io/en/stable/rest-api/ documentation
     # for more information.

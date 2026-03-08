@@ -6,6 +6,8 @@ services:
       - trade
       - --config
       - user_data/config.json
+      - --config
+      - /freqtrade/configs/pairlist-static-bybit-futures-usdt-top30.json
       - --strategy-path
       - user_data/strategies
       - --strategy

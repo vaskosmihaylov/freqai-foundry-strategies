@@ -15,10 +15,11 @@ from statistics import mean, pstdev
 from typing import Any
 
 TRADING_DAYS_PER_YEAR = 365.0
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_TARGETS: dict[str, Path] = {
-    "quickadapter": Path("quickadapter/user_data/config.json"),
-    "reforcexy": Path("ReforceXY/user_data/config.json"),
+    "quickadapter": REPO_ROOT / "quickadapter/user_data/config.json",
+    "reforcexy": REPO_ROOT / "ReforceXY/user_data/config.json",
 }
 
 DATE_COLUMNS = ("close_date", "close_date_utc", "open_date", "open_date_utc")
@@ -162,7 +163,11 @@ def resolve_targets(args: argparse.Namespace) -> list[tuple[str, Path, Path | No
         raise TradeReportError("--db can only be used together with --config")
 
     if args.config:
-        return [(args.config.stem, args.config.resolve(), args.db.resolve() if args.db else None)]
+        config_path = args.config if args.config.is_absolute() else (Path.cwd() / args.config)
+        database_path = None
+        if args.db:
+            database_path = args.db if args.db.is_absolute() else (Path.cwd() / args.db)
+        return [(config_path.stem, config_path.resolve(), database_path.resolve() if database_path else None)]
 
     if args.strategy == "all":
         return [(name, path.resolve(), None) for name, path in DEFAULT_TARGETS.items()]

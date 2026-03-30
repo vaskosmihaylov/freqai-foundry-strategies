@@ -427,6 +427,9 @@ def format_number(value: float | int | None, decimals: int = 2) -> str:
 
 
 def render_table(reports: list[Report]) -> str:
+    if not reports:
+        return "No successful reports."
+
     headers = [
         "Strategy",
         "Trades",
@@ -487,14 +490,27 @@ def render_table(reports: list[Report]) -> str:
 def main() -> int:
     args = parse_args()
     reports: list[Report] = []
+    errors: list[tuple[str, str]] = []
     for name, config_path, database_override in resolve_targets(args):
-        reports.append(compute_report(name, config_path, database_override))
+        try:
+            reports.append(compute_report(name, config_path, database_override))
+        except TradeReportError as error:
+            errors.append((name, str(error)))
 
-    print(render_table(reports))
-    print()
-    for report in reports:
-        print(f"{report.name}: {report.database}")
-    return 0
+    if reports:
+        print(render_table(reports))
+        print()
+        for report in reports:
+            print(f"{report.name}: {report.database}")
+
+    if errors:
+        if reports:
+            print()
+        print("Errors:")
+        for name, message in errors:
+            print(f"- {name}: {message}")
+
+    return 0 if reports else 1
 
 
 if __name__ == "__main__":

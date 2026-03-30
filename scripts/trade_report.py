@@ -152,8 +152,70 @@ def strip_jsonc_comments(text: str) -> str:
     return "".join(output)
 
 
+def normalize_jsonc_layout(text: str) -> str:
+    """Repair common JSONC layout issues into valid JSON."""
+
+    lines = [line.rstrip() for line in text.splitlines()]
+    normalized_lines: list[str] = []
+    previous: str | None = None
+
+    def is_value_end(line: str) -> bool:
+        stripped = line.rstrip()
+        return stripped.endswith(("}", "]", '"')) or stripped.endswith(
+            ("true", "false", "null")
+        ) or stripped[-1:].isdigit()
+
+    def starts_new_value(line: str) -> bool:
+        stripped = line.lstrip()
+        return (
+            stripped.startswith('"')
+            or stripped.startswith("{")
+            or stripped.startswith("[")
+            or stripped.startswith(("true", "false", "null"))
+            or stripped[:1].isdigit()
+            or stripped.startswith("-")
+        )
+
+    for current in lines:
+        if not current.strip():
+            continue
+        if previous is None:
+            previous = current
+            continue
+
+        if previous.rstrip().endswith(",") and current.lstrip().startswith(("}", "]")):
+            previous = previous.rstrip().rstrip(",")
+
+        if is_value_end(previous) and starts_new_value(current):
+            stripped = current.lstrip()
+            key_line = stripped.startswith('"') and ":" in stripped
+            open_value_line = stripped.startswith(("{", "["))
+            scalar_value_line = not key_line and (
+                stripped.startswith('"')
+                or stripped.startswith(("true", "false", "null"))
+                or stripped[:1].isdigit()
+                or stripped.startswith("-")
+            )
+            if key_line or open_value_line or scalar_value_line:
+                previous = previous.rstrip()
+                if not previous.endswith(","):
+                    previous = previous + ","
+
+        normalized_lines.append(previous)
+        previous = current
+
+    if previous is not None:
+        if previous.rstrip().endswith(","):
+            previous = previous.rstrip().rstrip(",")
+        normalized_lines.append(previous)
+
+    return "\n".join(normalized_lines)
+
+
 def load_jsonc(path: Path) -> dict[str, Any]:
-    return json.loads(strip_jsonc_comments(path.read_text(encoding="utf-8")))
+    stripped = strip_jsonc_comments(path.read_text(encoding="utf-8"))
+    normalized = normalize_jsonc_layout(stripped)
+    return json.loads(normalized)
 
 
 def resolve_targets(args: argparse.Namespace) -> list[tuple[str, Path, Path | None]]:

@@ -8,7 +8,6 @@
 #   docker compose -f docker-compose.yml -f docker-compose.windows-gpu.yml -f docker-compose.wsl-top30-optuna.yml up -d --build
 services:
   freqtrade:
-    user: "${UID}:${GID}"
     # image: freqtradeorg/freqtrade:stable_freqai
     # # Enable GPU Image and GPU Resources
     # # Make sure to uncomment the whole deploy section

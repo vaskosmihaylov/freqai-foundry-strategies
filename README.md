@@ -192,6 +192,17 @@ docker compose logs -f freqtrade
 docker logs -f freqtrade-quickadapter
 ```
 
+**Summarize local trade performance from the SQLite trade databases:**
+
+```shell
+# from repo root, summarize both strategies
+python3 scripts/trade_report.py
+
+# summarize one strategy only
+python3 scripts/trade_report.py --strategy quickadapter
+python3 scripts/trade_report.py --strategy reforcexy
+```
+
 **Stop and remove the compose stack:**
 
 ```shell
